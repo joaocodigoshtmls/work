@@ -32,8 +32,14 @@ if (!fs.existsSync(uploadsDir)) {
   console.log('📁 Pasta de uploads criada:', uploadsDir);
 }
 
-// Servir arquivos estáticos
-app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
+// 🔧 ALTERADO: Servir /uploads SEM CACHE para evitar avatar “fantasma”
+app.use('/uploads', express.static(path.join(process.cwd(), 'uploads'), {
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
+}));
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -41,7 +47,8 @@ const storage = multer.diskStorage({
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, `profile-${req.user.sub}-${uniqueSuffix}${path.extname(file.originalname)}`);
+    // usa o ID do token (req.user.sub)
+    cb(null, `profile-${req.user?.sub || 'anon'}-${uniqueSuffix}${path.extname(file.originalname)}`);
   }
 });
 
@@ -448,6 +455,7 @@ app.post('/admin/migrate-profile-pictures', async (req, res) => {
 });
 
 /* ===== Upload de foto de perfil ===== */
+// 🔧 ALTERADO: resposta com cache-bust e deleção de arquivo anterior robusta
 app.post('/api/user/profile-picture', authenticateToken, upload.single('profilePicture'), async (req, res) => {
   try {
     if (!req.file) {
@@ -455,36 +463,75 @@ app.post('/api/user/profile-picture', authenticateToken, upload.single('profileP
     }
 
     const userId = req.user.sub;
-    const profilePictureUrl = `/uploads/profile-pics/${req.file.filename}`;
+    const relPath = `/uploads/profile-pics/${req.file.filename}`;
 
     // Buscar foto antiga para deletar
-    const [oldPicture] = await pool.execute(
+    const [oldPictureRows] = await pool.execute(
       'SELECT profile_picture FROM users WHERE id = ?',
       [userId]
     );
+    const oldPic = oldPictureRows?.[0]?.profile_picture || null;
 
     // Atualizar no banco
     await pool.execute(
       'UPDATE users SET profile_picture = ?, updated_at = NOW() WHERE id = ?',
-      [profilePictureUrl, userId]
+      [relPath, userId]
     );
 
-    // Deletar foto antiga se existir e não for do Google
-    if (oldPicture[0]?.profile_picture && !oldPicture[0].profile_picture.includes('googleusercontent.com')) {
-      const oldFilePath = path.join(process.cwd(), oldPicture[0].profile_picture);
-      if (fs.existsSync(oldFilePath)) {
-        fs.unlinkSync(oldFilePath);
+    // Deletar foto antiga se existir e não for externa
+    if (oldPic && !oldPic.includes('googleusercontent.com')) {
+      const rel = oldPic.startsWith('/') ? oldPic.slice(1) : oldPic; // 🔧 NOVO: remove / inicial
+      const abs = path.join(process.cwd(), rel);
+      // segurança: garante que está dentro da pasta de uploads de profile-pics
+      if (abs.startsWith(uploadsDir) && fs.existsSync(abs)) {
+        try { fs.unlinkSync(abs); } catch {}
       }
     }
 
+    // 🔧 NOVO: retorna URL com versão para quebrar cache
     res.json({
       success: true,
-      profilePictureUrl,
+      profilePictureUrl: `${relPath}?v=${Date.now()}`,
       message: 'Foto de perfil atualizada com sucesso'
     });
 
   } catch (err) {
     console.error('Erro no upload da foto:', err);
+    res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
+
+// 🔧 NOVO: DELETE da foto de perfil (zera DB e apaga arquivo local)
+app.delete('/api/user/profile-picture', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+
+    const [rows] = await pool.execute(
+      'SELECT profile_picture FROM users WHERE id = ?',
+      [userId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+    const current = rows[0]?.profile_picture || null;
+
+    // Zera no banco
+    await pool.execute(
+      'UPDATE users SET profile_picture = NULL, updated_at = NOW() WHERE id = ?',
+      [userId]
+    );
+
+    // Apaga arquivo físico se local
+    if (current && !current.includes('googleusercontent.com')) {
+      const rel = current.startsWith('/') ? current.slice(1) : current;
+      const abs = path.join(process.cwd(), rel);
+      if (abs.startsWith(uploadsDir) && fs.existsSync(abs)) {
+        try { fs.unlinkSync(abs); } catch {}
+      }
+    }
+
+    res.json({ success: true, profilePictureUrl: null, message: 'Foto de perfil removida' });
+  } catch (err) {
+    console.error('Erro ao remover foto:', err);
     res.status(500).json({ error: 'Erro interno do servidor' });
   }
 });

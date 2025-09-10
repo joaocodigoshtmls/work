@@ -11,10 +11,14 @@ import {
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3001";
 
-// Monta URL absoluta para exibir avatar
+/* =========================
+   Helpers
+   ========================= */
+
+// Monta URL absoluta para exibir avatar (SEM fallback fantasma)
 function toAvatarUrl(u) {
-  const candidate = u?.profile_picture || u?.photoURL || u?.avatar || "";
-  if (!candidate) return "/avatar-default.png"; // <- padrão p/ todos
+  const candidate = u?.profile_picture || "";
+  if (!candidate) return "/avatar-default.png"; // padrão p/ todos
   if (/^https?:\/\//i.test(candidate)) return candidate;
   const path = candidate.startsWith("/") ? candidate : `/${candidate}`;
   return `${API_BASE}${path}`;
@@ -57,6 +61,10 @@ function hexToRgb(hex) {
   return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
 }
 
+/* =========================
+   Componente
+   ========================= */
+
 export default function FotoHub() {
   const { usuario, setUsuario, updateProfilePicture } = useUser();
   const safeUser = usuario || {};
@@ -88,11 +96,13 @@ export default function FotoHub() {
     setTimeout(() => setMessage(null), 3500);
   };
 
+  // Envia um Blob/Arquivo para o endpoint de upload do back
   const uploadBlobAsFile = async (blob, filename = "profile.png") => {
     const token = getToken();
     if (!token) throw new Error("Sessão expirada. Faça login novamente.");
 
     const form = new FormData();
+    // NOME DO CAMPO TEM QUE SER profilePicture (multer.single('profilePicture'))
     form.append("profilePicture", new File([blob], filename, { type: blob.type || "image/png" }));
 
     const r = await fetch(`${API_BASE}/api/user/profile-picture`, {
@@ -105,20 +115,23 @@ export default function FotoHub() {
       throw new Error(data?.error || data?.message || "Falha ao enviar imagem.");
     }
 
-    // Atualiza contexto/localStorage
-    const updated = { ...safeUser, profile_picture: data.profilePictureUrl || safeUser.profile_picture };
+    // A resposta já vem com ?v=timestamp; para persistir no usuário, salvamos sem o ?v=
+    const returned = data.profilePictureUrl || safeUser.profile_picture;
+    const cleanPath = (returned || "").replace(API_BASE, "").replace(/\?v=.*$/, "");
+    const updated = { ...safeUser, profile_picture: cleanPath || null };
     setUsuario(updated);
     try { localStorage.setItem("usuario", JSON.stringify(updated)); } catch {}
-    const fullUrl =
-      data.profilePictureFullUrl ||
-      (data.profilePictureUrl
-        ? `${API_BASE}${data.profilePictureUrl.startsWith("/") ? data.profilePictureUrl : "/" + data.profilePictureUrl}`
-        : null);
-    if (fullUrl) updateProfilePicture(`${fullUrl}?v=${Date.now()}`); // cache-bust no header
+
+    // Atualiza header/preview com cache-busting
+    const full = /^https?:\/\//i.test(returned)
+      ? returned
+      : `${API_BASE}${returned?.startsWith("/") ? returned : "/" + returned}`;
+    if (full) updateProfilePicture(`${full}?v=${Date.now()}`);
 
     return data;
   };
 
+  // Upload local
   const handleUploadLocal = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -144,37 +157,21 @@ export default function FotoHub() {
     }
   };
 
-  // Importar por URL/Drive (backend baixa e salva)
+  // Importar por URL/Drive — faz o download no cliente e reenvia ao teu POST existente
   const handleImportUrl = async () => {
     if (!urlInput) return;
-    const token = getToken();
-    if (!token) return showMsg("err", "Sessão expirada.");
-
     try {
       setBusy(true);
-      const body = { imageUrl: normalizeDriveUrl(urlInput) };
-      const r = await fetch(`${API_BASE}/api/user/profile-picture-from-url`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok || !data?.success) {
-        throw new Error(data?.error || data?.message || "Falha ao importar imagem.");
+      const normalized = normalizeDriveUrl(urlInput);
+      const resp = await fetch(normalized, { mode: "cors" });
+      if (!resp.ok) throw new Error("Não foi possível baixar a imagem dessa URL.");
+      const ct = resp.headers.get("content-type") || "";
+      if (!/image\/(png|jpe?g|webp|gif)/i.test(ct)) {
+        // ainda tentamos, mas avisamos
+        console.warn("Content-Type não parece imagem:", ct);
       }
-      const updated = { ...safeUser, profile_picture: data.profilePictureUrl || safeUser.profile_picture };
-      setUsuario(updated);
-      try { localStorage.setItem("usuario", JSON.stringify(updated)); } catch {}
-      const fullUrl =
-        data.profilePictureFullUrl ||
-        (data.profilePictureUrl
-          ? `${API_BASE}${data.profilePictureUrl.startsWith("/") ? data.profilePictureUrl : "/" + data.profilePictureUrl}`
-          : null);
-      if (fullUrl) updateProfilePicture(`${fullUrl}?v=${Date.now()}`);
-
+      const blob = await resp.blob();
+      await uploadBlobAsFile(blob, `from_url_${Date.now()}.png`);
       setUrlInput("");
       showMsg("ok", "Foto importada!");
     } catch (err) {
@@ -227,17 +224,11 @@ export default function FotoHub() {
   const saveTinted = async () => {
     try {
       setBusy(true);
-      // sem cor -> volta ao original (só reenvia a base)
-      if (!tint?.hex) {
-        const blob = await colorizeDarkBackground(baseAvatarUrl, null);
-        await uploadBlobAsFile(blob, `original_${Date.now()}.png`);
-        showMsg("ok", "Foto original aplicada!");
-        return;
-      }
-      const blob = await colorizeDarkBackground(baseAvatarUrl, tint.hex);
+      // sem cor -> volta ao original (reenvia a base)
+      const blob = await colorizeDarkBackground(baseAvatarUrl, tint?.hex || null);
       if (!blob) throw new Error("Falha ao gerar imagem.");
-      await uploadBlobAsFile(blob, `color_${tint.label}_${Date.now()}.png`);
-      showMsg("ok", `Foto ${tint.label} salva!`);
+      await uploadBlobAsFile(blob, `${tint?.hex ? `color_${tint.label}` : "original"}_${Date.now()}.png`);
+      showMsg("ok", tint?.hex ? `Foto ${tint.label} salva!` : "Foto original aplicada!");
     } catch (err) {
       showMsg("err", err.message || "Erro ao aplicar cor.");
     } finally {
@@ -279,7 +270,7 @@ export default function FotoHub() {
         )}
       </div>
 
-      {/* Tabs (quebra em múltiplas linhas se precisar) */}
+      {/* Tabs */}
       <div className="flex flex-wrap gap-2 mb-4">
         {[
           { id: "galeria", label: "Galeria", icon: <Upload className="size-4" /> },
@@ -302,7 +293,7 @@ export default function FotoHub() {
         ))}
       </div>
 
-      {/* Conteúdo compacto */}
+      {/* Conteúdo */}
       {tab === "galeria" && (
         <div className="space-y-2">
           <input
